@@ -4,6 +4,7 @@ import glob
 import numpy as np
 import torch
 import pandas as pd
+from tqdm import tqdm
 
 
 import decord
@@ -148,6 +149,7 @@ if __name__ == "__main__":
     annotations = pd.read_csv(args.annotations)
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # device = "cpu"
 
     dataset = VideoFramesIterator(
         annotations=annotations,
@@ -183,11 +185,13 @@ if __name__ == "__main__":
         param.requires_grad = False
         param.grad = None
 
-    config = GPTConfig(n_embd=2048, n_layer=8, n_head=2, block_size=2048)
+    config = GPTConfig(n_embd=2048, n_layer=8, n_head=2, block_size=8192)
     config.vae_size = 8192
     model = GPT(config).to(device)
 
-    for batch in dataloader:
+    optimizer = model.configure_optimizers(0.0001, 1e-4, (0.9, 0.95), device)
+
+    for batch in tqdm(dataloader):
         batched_frames = []
         batched_annotations = []
         for index, instance in enumerate(batch):
@@ -195,10 +199,8 @@ if __name__ == "__main__":
             annotations = instance["annotations"]
 
             for t, annotation in enumerate(annotations):
-                try:
-                    annotations[t] = annotation.cuda()
-                except RuntimeError:
-                    breakpoint()
+                annotations[t] = annotation.to(device)
+
 
             batched_annotations.append(annotations)
 
@@ -215,5 +217,11 @@ if __name__ == "__main__":
                 frames[t] = features
             batched_frames.append(frames)
 
-        loss = model.forward(batched_annotations, batched_frames)
+        # zero gradietns
+
+        _, loss = model.forward(batched_annotations, batched_frames)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        print(loss)
 
