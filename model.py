@@ -121,9 +121,12 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        assert config.vae_size is not None
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
+            wtte = nn.Embedding(3, config.n_embd), # type embeddings: 0 - token, 1 - video, 2 - padding
+            wve = nn.Linear(config.vae_size, config.n_embd, bias=False), # video embeddings
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
@@ -131,11 +134,13 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.vm_head = nn.Linear(config.n_embd, config.vae_size, bias=False) # video meta head
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # self.transformer.wve.weight = self.vm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
@@ -167,27 +172,124 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+    # @torch.no_grad()
+    # def get_contiguous_lengths(self, tidx):
+    #     # Find the indices where the sequence transitions from one value to another
+    #     transitions = torch.cat((torch.tensor([-1]), torch.diff(tidx).nonzero().squeeze(), torch.tensor([len(tidx)-1])))
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+    #     # Calculate the lengths of the contiguous sequences
+    #     lengths = transitions[1:] - transitions[:-1]
+
+    #     # Extract the values corresponding to the transitions
+    #     values = tidx[(transitions + 1)[:-1]]
+
+    #     return lengths, values
+
+    def forward(self, batched_annotations, batched_frames, annotation_first=True, autoregressive_loss=True):
+        # batched_annotations: List[List[Tensor]]
+        # batched_frames: List[List[Tensor]]
+        assert annotation_first # TODO: currently we're training text-conditional
+
+        device = batched_annotations[0][0].device
+
+        inps = []
+        types = []
+        for i in range(len(batched_annotations)):
+            annotations = batched_annotations[i]
+            frames = batched_frames[i]
+            x = []
+            typ = []
+            for annotation, frame in zip(annotations, frames):
+                tok_emb = self.transformer.wte(annotation)
+                frame_emb = self.transformer.wve(frame)
+                x.append(tok_emb)
+                x.append(frame_emb)
+                typ.append(torch.tensor([0] * len(annotation), dtype=torch.long, device=device))
+                typ.append(torch.tensor([1] * len(frame), dtype=torch.long, device=device))
+
+            if len(annotations) == len(frames) + 1:
+                tok_emb = self.transformer.wte(annotations[-1])
+                x.append(tok_emb)
+                typ.append(torch.tensor([0] * len(annotations[-1]), dtype=torch.long, device=device))
+
+            elif len(frames) == len(annotations) + 1:
+                frame_emb = self.transformer.wve(frames[-1])
+                x.append(frame_emb)
+                typ.append(torch.tensor([1] * len(frames[-1]), dtype=torch.long, device=device))
+
+
+            inps.append(torch.cat(x, dim=0))
+            types.append(torch.cat(typ, dim=0))
+
+        inps = torch.nn.utils.rnn.pad_sequence(inps, batch_first=True)
+        types_input = torch.nn.utils.rnn.pad_sequence(types, batch_first=True, padding_value=2)
+
+        B, T, E = inps.size()
+        pos = (types_input != 2).cumsum(dim=1) - 1
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        type_emb = self.transformer.wtte(types_input) # type embeddings of shape (b, t, n_embd)
+
+        x = inps + pos_emb + type_emb
+
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
+        if autoregressive_loss:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            total_token_loss = 0.0
+            total_frame_loss = 0.0
+            total_token_steps = 0.0
+            total_frame_steps = 0.0
+
+            for i in range(B):
+                annotations = batched_annotations[i]
+                frames = batched_frames[i]
+                token_loss = 0.0
+                frame_loss = 0.0
+                token_steps = 0.0
+                frame_steps = 0.0
+
+                current_index = 0
+
+                out = x[i]
+                typ = types[i][1:]
+                for t, (annotation, frame) in enumerate(zip(annotations, frames)):
+                    if t == 0:
+                        annotation = annotation[1:]
+
+                    tok_out = self.lm_head(out[current_index:current_index+len(annotation), :])
+                    token_loss += F.cross_entropy(tok_out.view(-1, tok_out.size(-1)), annotation.view(-1), ignore_index=-1)
+                    token_steps += (typ[current_index:current_index+len(annotation)] == 0).sum()
+
+                    frame_out = self.vm_head(out[current_index+len(annotation):current_index+len(annotation)+len(frame), :])
+                    frame_loss += F.mse_loss(frame_out, frame)
+                    frame_steps += (typ[current_index+len(annotation):current_index+len(annotation)+len(frame)] == 1).sum()
+
+                    current_index += len(annotation) + len(frame)
+
+                if len(annotations) == len(frames) + 1:
+                    tok_out = self.lm_head(out[current_index:current_index+len(annotation), :])
+                    token_loss += F.cross_entropy(tok_out.view(-1, tok_out.size(-1)), annotation.view(-1), ignore_index=-1)
+                    token_steps += (typ[current_index:current_index+len(annotation)] == 0).sum()
+                    current_index += len(annotation)
+
+                elif len(frames)  == len(annotations) + 1:
+                    frame_out = self.vm_head(out[current_index:current_index+len(frame), :])
+                    frame_loss += F.mse_loss(frame_out, frame)
+                    frame_steps += (typ[current_index:current_index+len(frame)] == 1).sum()
+                    current_index += len(frame)
+
+                total_token_loss += token_loss
+                total_frame_loss += frame_loss
+                total_token_steps += token_steps
+                total_frame_steps += frame_steps
+
+            loss = (total_token_loss + total_frame_loss) / (total_token_steps + total_frame_steps)
+            logits = None
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = x[:, [-1], :] # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
